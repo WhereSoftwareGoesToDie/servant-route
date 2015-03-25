@@ -3,14 +3,17 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE TypeFamilies          #-}
 {-# LANGUAGE TypeOperators         #-}
 
 -- | Description:  servers for Servant APIs.
 module Servant.Route (
-  Decision,
-  IsRouted(..)
+  Decision(..),
+  IsRouted(..),
+  routingServer,
 ) where
 
+import Data.Aeson hiding (Error)
 import Data.ByteString (ByteString)
 import Data.Maybe
 import Data.Monoid
@@ -18,11 +21,22 @@ import Data.Proxy
 import Data.String.Conversions (cs)
 import qualified Data.Text as T
 import GHC.TypeLits
-import Network.HTTP.Types hiding (Status (..), Header(..))
+import Network.HTTP.Types hiding (Header (..), Status (..))
 import Network.Wai
 import Servant.API
 import Servant.Common.Text
 import qualified Servant.Server.Internal as S
+
+-- | Use 'IsRouted' instances to
+--
+-- > app :: Application
+-- > app = routingServer api server
+routingServer
+    :: (IsRouted api, S.HasServer api)
+    => Proxy api
+    -> S.Server api
+    -> Application
+routingServer p server = S.toApplication (S.route p server)
 
 type Status = (Int, ByteString)
 
@@ -51,17 +65,30 @@ invalid = Error
 -- | TODO: Make correct.
 type Predicate = Request -> Decision
 
-class IsRouted layout where
+type API = ("a" :> "b" :> QueryParam "poop" Int :> Get Int)
+    :<|> (Capture "poopin" String :> QueryParam "inthe" String :> Post String)
+    :<|> ("c" :> (Capture "cat" String :<|> Capture "dog" Int) :> Delete)
+
+-- | Perform routing according to normal rules for mapping URIs to \"physical\"
+-- resources.
+--
+-- The 'match' method inspects the 'Request' to determine whether it should be
+-- handled by the @layout@ resource. This idea is to check /only/ that this is
+-- the correct handler, /not/ that the request is correct and complete. This
+-- ensures that we'll call a specific 'HasServer' instance which can return
+-- meaningful errors if required.
+class (S.HasServer layout) => IsRouted layout where
     -- | Check that a request matches this resource.
     --
     -- Essentially: "Is this the physical resource that should handle the
     -- request?"
     match :: Proxy layout -> Predicate
 
-    -- | Check that a request is valid for this resource.
-    --
-    -- Essentially: "Do the inputs make this physical resource happy?"
-    validate :: Proxy layout -> Predicate
+instance (IsRouted first, IsRouted rest, S.HasServer first, S.HasServer rest)
+        => IsRouted (first :<|> rest) where
+
+    match p req = match (Proxy :: Proxy first) req
+                <> match (Proxy :: Proxy rest) req
 
 instance (KnownSymbol path, IsRouted sublayout) => IsRouted (path :> sublayout) where
     match _ req = case S.processedPathInfo req of
@@ -71,14 +98,7 @@ instance (KnownSymbol path, IsRouted sublayout) => IsRouted (path :> sublayout) 
       where
         proxyPath = Proxy :: Proxy path
 
-    validate _ req = case S.processedPathInfo req of
-            (first : rest) | first == cs (symbolVal proxyPath) ->
-                validate (Proxy :: Proxy sublayout) req{ pathInfo = rest }
-            _ -> invalid (404, "Not Found")
-      where
-        proxyPath = Proxy :: Proxy path
-
--- | Check the patch contains a value for a 'Capture' and that it's 
+-- | Check the patch contains a value for a 'Capture' and that it's
 instance (KnownSymbol capture, FromText a, IsRouted sublayout)
     => IsRouted (Capture capture a :> sublayout) where
 
@@ -88,39 +108,25 @@ instance (KnownSymbol capture, FromText a, IsRouted sublayout)
                 match (Proxy :: Proxy sublayout) req{ pathInfo = rest }
             _ -> reject Nothing
 
-    -- Check that the value can be read as an 'a'.
-    validate _ req = case S.processedPathInfo req of
-            (first : rest) | isJust (S.captured captureProxy first) ->
-                validate (Proxy :: Proxy sublayout) req{ pathInfo = rest }
-            _ -> invalid (404, "Not Found")
-      where
-        captureProxy = Proxy :: Proxy (Capture capture a)
-
-
--- | Check the request method is GET.
-instance IsRouted (Get result) where
+-- | Check the method.
+instance (ToJSON result) => IsRouted (Get result) where
     match _ = matchMethod methodGet
-    validate _ _ = accept
 
--- | Check the request method is PUT.
-instance IsRouted (Put result) where
+-- | Check the method.
+instance (ToJSON result) => IsRouted (Put result) where
     match _ = matchMethod methodPut
-    validate _ _ = accept
 
--- | Check the request method is POST.
-instance IsRouted (Post result) where
+-- | Check the method.
+instance (ToJSON result) => IsRouted (Post result) where
     match _ = matchMethod methodPost
-    validate _ _ = accept
 
--- | Check the request method is DELETE.
+-- | Check the method.
 instance IsRouted Delete where
     match _ = matchMethod methodDelete
-    validate _ _ = accept
 
 -- | Leave all routing decisions up to a 'Raw' endpoint.
 instance IsRouted Raw where
     match _ _ = accept
-    validate _ _ = accept
 
 -- | Check that the request has an acceptable HTTP method.
 matchMethod
@@ -131,35 +137,32 @@ matchMethod method req =
         then accept
         else reject $ Just (405, "Method Not Allowed")
 
--- | Request headers do not affect routing.
-instance (KnownSymbol sym, IsRouted sublayout)
+-- | Ignore when routing.
+instance (KnownSymbol sym, FromText a, IsRouted sublayout)
         => IsRouted (Header sym a :> sublayout) where
 
     match _ = match (Proxy :: Proxy sublayout)
-    validate _ = validate (Proxy :: Proxy sublayout)
 
--- | The request body does not affect routing.
-instance (IsRouted sublayout) => IsRouted (ReqBody a :> sublayout) where
+-- | Ignore when routing.
+instance (FromJSON a, IsRouted sublayout)
+        => IsRouted (ReqBody a :> sublayout) where
+
     match _ = match (Proxy :: Proxy sublayout)
-    validate _ = validate (Proxy :: Proxy sublayout)
 
--- | A query parameter does not affect routing.
-instance (KnownSymbol sym, IsRouted sublayout)
+-- | Ignore when routing.
+instance (KnownSymbol sym, FromText a, IsRouted sublayout)
         => IsRouted (QueryParam sym a :> sublayout) where
 
     match _ = match (Proxy :: Proxy sublayout)
-    validate _ = validate (Proxy :: Proxy sublayout)
 
--- | Query parameters do not affect routing.
-instance (KnownSymbol sym, IsRouted sublayout)
+-- | Ignore when routing.
+instance (KnownSymbol sym, FromText a, IsRouted sublayout)
         => IsRouted (QueryParams sym a :> sublayout) where
 
     match _ = match (Proxy :: Proxy sublayout)
-    validate _ = validate (Proxy :: Proxy sublayout)
 
--- | A query flag does not affect routing.
+-- | Ignore when routing.
 instance (KnownSymbol sym, IsRouted sublayout)
         => IsRouted (QueryFlag sym :> sublayout) where
 
     match _ = match (Proxy :: Proxy sublayout)
-    validate _ = validate (Proxy :: Proxy sublayout)
